@@ -1,0 +1,7 @@
+---
+api_credentials:
+  # Obtain at https://upgrade.yubico.com/getapikey/
+  id: <id here>
+  secret: <secret here>
+yubikeys:
+  openvpn_username: 'first 12 characters of the Yubikey OTP'

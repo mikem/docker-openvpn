@@ -1,0 +1,342 @@
+#!/usr/bin/perl
+# Copyright (c) 2017 Steven Haigh <netwiz@crc.id.au>
+# https://www.crc.id.au
+# Licensed under the GPL version 2
+
+# PURPOSE: This script automatically can be used to handle authentication
+# of Yubikey enabled accounts for One Time Password (OTP) use.
+
+# INSTALL NOTES:
+# Place this script in /etc/openvpn and use the following in your server
+# configuration file:
+
+# script-security 2
+# client-connect          /etc/openvpn/yubikey-auth-tokens
+# client-disconnect       /etc/openvpn/yubikey-auth-tokens
+# auth-user-pass-verify   /etc/openvpn/yubikey-auth-tokens via-file
+# client-cert-not-required
+
+# If you wish to use Client Certificate + username + OTP for authentication
+# exclude the 'client-cert-not-required' option and use any other guide on
+# how to manage the certificate side of authentication.
+
+# USAGE NOTES:
+# To set up your Yubikey in Yubico OTP mode, use the personalisation tool
+# in "Yubico OTP mode", and choose 'Quick' setup. Be sure to generate new
+# values and then use the 'Upload to Yubico' to activate your key within
+# the Yubico Validation Server.
+
+# Edit the %yubikeys definition below to include your chosen username and
+# the first 12 digits of one of your Yubico OTP passwords.
+
+# If you have a Yubico API ID, you may substitute the $yubico_id value
+# for your own, or use the default '16'.
+
+# The token store specified in $tokenstore should point to a file in a
+# directory that openvpn can write to. Tokens will be stored here between
+# renegotions. The token will be deleted at last access + 2 hours, or
+# when the client disconnects.
+
+# NOTE: Tokens are only removed when something triggers a read of the
+# tokens file. This can be a new client connecting, a renegotiation or
+# a client disconnecting.
+
+# Modified 2018 by Rob Johnson <rob.johnson@diffblue.com> to incorporate
+# signature validation.
+
+# ------------------ CODE BEGINS HERE -----------------
+use strict;
+use warnings;
+use Fcntl qw( :flock );
+use Storable qw( retrieve_fd store_fd );
+use LWP::UserAgent 6;
+use LWP::Protocol::https;
+use MIME::Base64 qw( encode_base64 decode_base64 );
+use Digest::HMAC_SHA1 qw( hmac_sha1 );
+use URI::Escape qw( uri_escape );
+use Data::Dumper;
+use Time::Piece;
+use Time::Seconds;
+use YAML::Tiny;
+$Data::Dumper::Sortkeys = 1;
+
+my $yubikey_config = YAML::Tiny->read('/etc/openvpn/yubikey-auth-config.yaml')->[0];
+
+#To access the Yubico API, and also a secret for HMAC validation
+my $yubico_id = $yubikey_config->{api_credentials}->{id};
+my $yubico_secret = $yubikey_config->{api_credentials}->{secret};
+
+my $yubikeys = $yubikey_config->{yubikeys};
+
+my $tokenstore = "/etc/openvpn/jail/token_store.bin";
+my $ca_bundle = "/etc/ssl/certs/ca-certificates.crt";
+my $debug = 0;
+my $TIMEOUT_SECS = 10;
+
+sub load_tokenstore()
+{
+	## If the token store doesn't exist, then create an empty one.
+	if ( ! -f $tokenstore )
+	{
+		open ( my $fd, ">", $tokenstore );
+		my %tokens = ();
+		store_fd \%tokens, \*$fd;
+		close $fd;
+	}
+
+	## Open the tokenstore and read in the contents.
+	open ( my $fd, "+<", $tokenstore ) or die "Unable to open token store $tokenstore: $!\n";
+	flock $fd, LOCK_EX;
+	my %tokens = %{ retrieve_fd($fd) };
+
+	## Expire tokens that should be expired.
+	foreach my $key ( keys %tokens )
+	{
+		if ( $tokens{$key}{expires} < time )
+		{
+			delete $tokens{$key};
+		}
+	}
+
+	if ( $debug )
+	{ 
+		print "Loaded Tokens:\n" . Dumper(\%tokens);
+	}
+
+	return $fd, %tokens;
+}
+
+sub write_tokenstore($\%)
+{
+	my $fd = shift;
+	my $hashref = shift;
+	seek $fd, 0, 0;
+	store_fd $hashref, \*$fd;
+	close $fd;
+	if ( $debug )
+	{ 
+		print "Saved Tokens:\n" . Dumper($hashref);
+	}
+}
+
+# if ( $debug )
+# {
+# 	print "DEBUG: Environment follows:\n" . Dumper(\%ENV);
+# }
+
+if ( $ENV{'script_type'} eq "user-pass-verify" )
+{
+	my $auth_file = $ARGV[0];
+
+	## Read the auth file.
+	open my $fh, '<', $auth_file;
+	chomp(my @lines = <$fh>);
+	close $fh;
+
+	my $username = $lines[0];
+	my $password = $lines[1];
+
+	## Ensure we have a valid entry for the expected username.
+	if ( ! defined( $yubikeys{$username} ) )
+	{
+		print "No yubikey enabled for $username\n";
+		exit 1;
+	}
+
+	## If we have the start of a yubikey (first 12 characters are the static key ID), validate the OTP against yubico.
+	if ( $password =~ m/^${yubikeys{$username}}/ )
+	{
+		## Check the yubikey entry is valid.
+		if ($debug)
+		{
+			print "Attempting Yubikey authentication for user: $username\n";
+		}
+		my $ua = LWP::UserAgent->new;
+		#Obviously make sure we're connecting to a known valid SSL host
+		$ua->ssl_opts( verify_hostname => 1, SSL_ca_file => $ca_bundle );
+		#Nonce generation - from https://www.codeproject.com/Articles/3681/Generating-quot-Random-quot-Strings-for-PERL-based
+		my @alphanumeric = ('a'..'z', 'A'..'Z', 0..9);
+		my $nonce = join '', map $alphanumeric[rand @alphanumeric], 16..40;
+
+		my %request_parameters = ('id' => $yubico_id, 'otp' => $password, 'nonce' => $nonce, 'sl' => 'secure', 'timeout' => $TIMEOUT_SECS);
+		my $query_string = join("&", map { "$_=$request_parameters{$_}" } sort keys %request_parameters);
+		my $unescaped_query_signature = encode_base64(hmac_sha1($query_string, decode_base64($yubico_secret)));
+		chomp $unescaped_query_signature;
+		my $query_signature = uri_escape($unescaped_query_signature);
+		$ua->timeout($TIMEOUT_SECS);
+		my @api_sources = ('api', 'api2', 'api3', 'api4', 'api5');
+		my $request_time = Time::Piece->new; #Now
+
+		my $response;
+		for my $api_source (@api_sources)
+		{
+			#Query string doesn't contain the signature, so append to the end
+			my $api_url = "https://$api_source.yubico.com/wsapi/2.0/verify?$query_string&h=$query_signature";
+			if ($debug)
+			{
+				print "Resolved query URL: $api_url\nRunning query...\n";
+			}
+			$response = $ua->get($api_url);
+			if ($response)
+			{
+				last;
+			}
+		}
+	
+		## Only go further if the HTTP request was successful (returns 200). Actual YubiCloud validation follows
+		if ( ! $response->is_success )
+		{
+			print "Error querying the YubiCo Servers: " . $response->status_line . " - " . $response->decoded_content . "\n";
+			exit 1;
+		}
+
+		if ($debug)
+		{
+			print "DEBUG: YubiCloud response follows:\n" . $response->content;
+		}
+
+		my $content = $response->content;
+		chomp $content; #Remove trailing whitespace, it's annoying
+
+		#Split the string on newlines and then on the first = into key-value pairs, makes a neat hash
+		my %response_parameters = map{split(/=/, $_, 2)}(split(/\R/, $content));
+
+		## Allow access ONLY on an OK response - no point validating a failed response.
+		if ( $response_parameters{'status'} eq "OK" )
+		{
+			## Verify the data returned from YubiCo.
+			if ($response_parameters{'otp'} ne $password)
+			{
+				print "Error: OTPs do not match! Possible replay attack! Sent: $password, received: ".$response_parameters{'otp'}."\n";
+				exit 1;
+			}
+			if ($response_parameters{'nonce'} ne $nonce)
+			{
+				print "Error: nonce values do not match! Possible replay attack! Sent: $nonce, received: ".$response_parameters{'nonce'}."\n";
+				exit 1;
+			}
+
+			#Check the response was made from this actual request and is not a replay
+			#Strip the Z off the end, it doesn't parse. Fortunately the time is in UTC already.
+			my $response_time = $response_parameters{'t'} =~ s/Z.+$//r;
+			my $parsed_time = Time::Piece->strptime($response_time, '%Y-%m-%dT%T');
+			if ($debug)
+			{
+				print "DEBUG: parsed time as:\n".$parsed_time->strftime('%y/%m/%d %H:%M')."\n";
+			}
+			my $max_tolerance_seconds = $TIMEOUT_SECS * scalar(@api_sources); #e.g. 50 seconds
+			if (abs($parsed_time - $request_time) > $max_tolerance_seconds)
+			{
+				print "Error: tolerance exceeded - response is greater than $max_tolerance_seconds seconds old. Possible replay attack!\n";
+				exit 1;
+			}
+
+			#HMAC validation - same as above, except without URL-safe'ing.
+			#Also need to remove the returned signature from the string as it obviously can't contain itself
+			my $response_signature = $response_parameters{'h'};
+			delete $response_parameters{'h'};
+			my $response_string = join("&", map { "$_=$response_parameters{$_}" } sort keys %response_parameters);
+			if ($debug)
+			{
+				print "DEBUG: response variable string:\n$response_string\n";
+			}
+			my $verify_signature = encode_base64(hmac_sha1($response_string, decode_base64($yubico_secret)));
+			chomp $verify_signature;
+
+			if ($debug)
+			{
+				print "DEBUG: calculated signature:\n$verify_signature\n";
+			}
+
+			if ($verify_signature ne $response_signature)
+			{
+				print "Error: signature in YubiCloud response is invalid!\n";
+				exit 1;
+			}
+
+			#Otherwise, fully validated
+			print "Yubikey authentication successful for user: $username\n";
+			exit 0;
+		}
+		else
+		{
+			print "Yubikey authentication for user $username failed with result: ".$response_parameters{'status'}."\n";
+			exit 1;
+		}
+	}
+
+	## We may have a token, not an OTP... Check.
+	if ( $password =~ m/^Token:/ )
+	{
+		print "Performing token authentication for user: $username\n";
+		$password =~ s/^Token://g;
+
+		## Load the token database.
+		my ($tokenstore_fh, %tokens) = load_tokenstore(); 
+		my $key = $ENV{'dev'} . '-' . $ENV{'trusted_ip'} . '-' . $ENV{'trusted_port'};
+		$tokens{$key}{'expires'} = time + 7200; ## Push the expiry back another 2 hours
+		write_tokenstore($tokenstore_fh, %tokens);
+
+		if ( $password eq $tokens{$key}{'token'} )
+		{
+			print "Token authentication successful for user: $username\n";
+			exit 0;
+		}
+		else
+		{
+			print "Token authentication failed for user: $username\n";
+			exit 1;
+		}
+	}
+
+	## Fall back to an authentication failed error.
+	print "Authentication failed for user $username\n";
+	exit 1;
+} 
+
+## Handle generation of the auth-token to be pushed to the client.
+elsif ( $ENV{'script_type'} eq "client-connect" )
+{
+	my $key = $ENV{'dev'} . '-' . $ENV{'trusted_ip'} . '-' . $ENV{'trusted_port'};
+	
+	## Create our random data.
+	open ( my $random, "<", "/dev/random");
+	read $random, my $random_data, 128;
+	close $random;
+	my $token = encode_base64($random_data, "");
+
+	my $push = 'push "auth-token Token:' . $token . '"' . "\n";
+	print "Pushing Auth-Token: $token\n";
+
+	## Add the token to the token store.
+	my ($tokenstore_fh, %tokens) = load_tokenstore(); 
+	$tokens{$key}{'token'} = $token;
+	$tokens{$key}{'expires'} = time + 7200; ## Expire in now + 2 hours.
+	write_tokenstore($tokenstore_fh, %tokens);
+
+	open my $fh, '>', $ARGV[0];
+	print $fh $push . "\n";
+	close $fh;
+	exit 0;
+}
+
+## Handle client disconnects by nuking the token.
+elsif ( $ENV{'script_type'} eq "client-disconnect" )
+{
+	print "Handling client disconnect. Nuking token\n";
+	my $key = $ENV{'dev'} . '-' . $ENV{'trusted_ip'} . '-' . $ENV{'trusted_port'};
+	my ($tokenstore_fh, %tokens) = load_tokenstore(); 
+	if ( defined( $tokens{$key} ) ) {
+		delete $tokens{$key};
+	}
+	write_tokenstore($tokenstore_fh, %tokens);
+	exit 0;
+}
+
+else
+{
+	print "We should never get here unless we have the wrong config!\n";
+	exit 1;
+}
+
+exit 1;

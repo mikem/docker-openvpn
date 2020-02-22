@@ -330,6 +330,22 @@ keepalive $OVPN_KEEPALIVE
 persist-key
 persist-tun
 
+### BEGIN Yubikey
+# To require a Yubikey OTP to sign in, copy
+# /etc/openvpn/yubikey-auth-config.yaml.sample to
+# /etc/openvpn/yubikey-auth-config.yaml and uncomment the lines below to
+# require Yubikey OTP to log in. See
+# https://www.crc.id.au/openvpn-otp-with-a-yubikey/ for more details.
+#script-security 2
+#auth-user-pass-verify   /usr/local/bin/yubikey-auth-tokens via-file
+
+# These two lines below seem to cause a deadlock and prevent successfuly
+# authentication. They're an optimization and not required, so they're
+# commented out.
+#client-connect          /usr/local/bin/yubikey-auth-tokens
+#client-disconnect       /usr/local/bin/yubikey-auth-tokens
+### END Yubikey
+
 proto $OVPN_PROTO
 # Rely on Docker to do port mapping, internally always 1194
 port 1194
