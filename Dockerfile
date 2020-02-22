@@ -7,7 +7,7 @@ LABEL maintainer="Kyle Manna <kyle@kylemanna.com>"
 
 # Testing: pamtester
 RUN echo "http://dl-cdn.alpinelinux.org/alpine/edge/testing/" >> /etc/apk/repositories && \
-    apk add --update openvpn iptables bash easy-rsa openvpn-auth-pam google-authenticator pamtester libqrencode perl perl-libwww perl-lwp-protocol-https perl-digest-hmac && \
+    apk add --update openvpn iptables bash easy-rsa openvpn-auth-pam google-authenticator pamtester libqrencode perl perl-libwww perl-lwp-protocol-https perl-digest-hmac perl-yaml-tiny && \
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
 
@@ -24,6 +24,7 @@ EXPOSE 1194/udp
 
 CMD ["ovpn_run"]
 
+ADD ./yubikey-auth-config.yaml.sample /etc/openvpn/yubikey-auth-config.yaml.sample
 ADD ./bin /usr/local/bin
 RUN chmod a+x /usr/local/bin/*
 
