@@ -137,14 +137,14 @@ if ( $ENV{'script_type'} eq "user-pass-verify" )
 	my $password = $lines[1];
 
 	## Ensure we have a valid entry for the expected username.
-	if ( ! defined( $yubikeys{$username} ) )
+	if ( ! defined( $yubikeys->{$username} ) )
 	{
 		print "No yubikey enabled for $username\n";
 		exit 1;
 	}
 
 	## If we have the start of a yubikey (first 12 characters are the static key ID), validate the OTP against yubico.
-	if ( $password =~ m/^${yubikeys{$username}}/ )
+        if ( $password =~ m/^$yubikeys->{$username}/ )
 	{
 		## Check the yubikey entry is valid.
 		if ($debug)
